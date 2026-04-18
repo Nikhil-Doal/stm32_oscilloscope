@@ -392,13 +392,13 @@ static void MX_GPIO_Init(void)
 /* USER CODE BEGIN 4 */
 void HAL_ADC_ConvHalfCpltCallback(ADC_HandleTypeDef *hadc)
 {
-	SCB_InvalidateICache_by_Addr((uint32_t*)adc_buf, ADC_BUF_LEN * sizeof(uint16_t));
+	SCB_InvalidateDCache_by_Addr((uint32_t*)adc_buf, ADC_BUF_LEN * sizeof(uint16_t) / 2);
     half_complete = 1;
 }
 
 void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef *hadc)
 {
-	SCB_InvalidateICache_by_Addr((uint32_t*)&adc_buf[ADC_BUF_LEN / 2], ADC_BUF_LEN * sizeof(uint16_t) / 2);
+	SCB_InvalidateDCache_by_Addr((uint32_t*)&adc_buf[ADC_BUF_LEN / 2], ADC_BUF_LEN * sizeof(uint16_t) / 2);
     full_complete = 1;
 }
 /* USER CODE END 4 */

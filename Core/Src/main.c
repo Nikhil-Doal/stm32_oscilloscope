@@ -22,6 +22,7 @@
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 #include <stdio.h>
+#include <math.h>
 #include <string.h>
 /* USER CODE END Includes */
 
@@ -53,6 +54,9 @@ uint16_t adc_buf[ADC_BUF_LEN];
 volatile uint8_t half_complete = 0;
 volatile uint8_t full_complete = 0;
 UART_HandleTypeDef huart3;
+
+#define FFT_SIZE 1024
+float fft_input[FFT_SIZE];
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -77,6 +81,13 @@ void MX_USART_UART_Init(void) {
 	huart3.Init.HwFlowCtl = UART_HWCONTROL_NONE;
 	huart3.Init.OverSampling = UART_OVERSAMPLING_16;
 	HAL_UART_Init(&huart3);
+}
+
+void apply_hann_window(uint16_t *src, float *dst, int len) {
+	for (int i = 0; i < len; ++i) {
+		float window = 0.5f * (1.0f - cosf(2.0f * M_PI * i / (len - 1)));
+		dst[i] = (float)src[i] * window;
+	}
 }
 /* USER CODE END 0 */
 
@@ -133,6 +144,7 @@ int main(void)
   {
 	  if (half_complete) {
 		  half_complete = 0;
+		  apply_hann_window(adc_buf, fft_input, FFT_SIZE);
 		  char msg[32];
 		  sprintf(msg, "H: %u\r\n", adc_buf[0]);
 		  HAL_UART_Transmit(&huart3, (uint8_t*)msg, strlen(msg), 100);

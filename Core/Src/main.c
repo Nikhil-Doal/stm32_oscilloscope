@@ -131,14 +131,19 @@ int main(void)
   /* USER CODE BEGIN WHILE */
   while (1)
   {
-	  HAL_ADC_Start(&hadc1);
-	  HAL_ADC_PollForConversion(&hadc1, 10);
-	  uint16_t adc_val = HAL_ADC_GetValue(&hadc1);
-	  HAL_ADC_Stop(&hadc1);
+	  if (half_complete) {
+		  half_complete = 0;
+		  char msg[32];
+		  sprintf(msg, "H: %u\r\n", adc_buf[0]);
+		  HAL_UART_Transmit(&huart3, (uint8_t*)msg, strlen(msg), 100);
+	  }
 
-	  char msg[32];
-	  sprintf(msg, "ADC: %u\r\n", adc_val);
-	  HAL_UART_Transmit(&huart3, (uint8_t*)msg, strlen(msg), 100);
+	  if (full_complete) {
+		  full_complete = 0;
+		  char msg[32];
+		  sprintf(msg, "F: %u\r\n", adc_buf[512]);
+		  HAL_UART_Transmit(&huart3, (uint8_t*)msg, strlen(msg), 100);
+	  }
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
@@ -373,7 +378,17 @@ static void MX_GPIO_Init(void)
 }
 
 /* USER CODE BEGIN 4 */
-void HAL_ADC_Con
+void HAL_ADC_ConvHalfCpltCallback(ADC_HandleTypeDef *hadc)
+{
+	SCB_InvalidateICache_by_Addr((uint32_t*)adc_buf, ADC_BUF_LEN * sizeof(uint16_t));
+    half_complete = 1;
+}
+
+void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef *hadc)
+{
+	SCB_InvalidateICache_by_Addr((uint32_t*)&adc_buf[ADC_BUF_LEN / 2], ADC_BUF_LEN * sizeof(uint16_t) / 2);
+    full_complete = 1;
+}
 /* USER CODE END 4 */
 
 /**

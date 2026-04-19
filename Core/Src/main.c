@@ -51,12 +51,12 @@ TIM_HandleTypeDef htim2;
 
 /* USER CODE BEGIN PV */
 #define ADC_BUF_LEN 1024
-uint16_t adc_buf[ADC_BUF_LEN];
+ALIGN_32BYTES(uint16_t adc_buf[ADC_BUF_LEN]);
 volatile uint8_t half_complete = 0;
 volatile uint8_t full_complete = 0;
 UART_HandleTypeDef huart3;
 
-#define FFT_SIZE 1024
+#define FFT_SIZE 512
 float fft_input[FFT_SIZE];
 
 arm_rfft_fast_instance_f32 fft_instance;
@@ -131,13 +131,17 @@ int main(void)
   /* USER CODE BEGIN 2 */
   __HAL_RCC_USART3_CLK_ENABLE();
   MX_USART_UART_Init();
-  HAL_TIM_Base_Start(&htim2);
   HAL_ADCEx_Calibration_Start(&hadc1, ADC_CALIB_OFFSET, ADC_SINGLE_ENDED);
   HAL_ADC_Start_DMA(&hadc1, (uint32_t*)adc_buf, ADC_BUF_LEN);
+  HAL_TIM_Base_Start(&htim2);
   arm_rfft_fast_init_f32(&fft_instance, FFT_SIZE);
 
   char *test = "UART OK\r\n";
   HAL_UART_Transmit(&huart3, (uint8_t*)test, strlen(test), 100);
+
+  char dbg[48];
+  int n = snprintf(dbg, sizeof dbg, "adc_buf @ 0x%08lX\r\n", (unsigned long)adc_buf);
+  HAL_UART_Transmit(&huart3, (uint8_t*)dbg, n, 100);
   /* USER CODE END 2 */
 
   /* Initialize leds */
@@ -152,37 +156,36 @@ int main(void)
   /* USER CODE BEGIN WHILE */
   while (1)
   {
-//	  if (half_complete) {
-//	      half_complete = 0;
-//	      char msg[] = "H\r\n";
-//	      HAL_UART_Transmit(&huart3, (uint8_t*)msg, 3, 100);
-//	  }
-	  if (half_complete) {
-		  half_complete = 0;
-		  apply_hann_window(adc_buf, fft_input, FFT_SIZE);
+	uint16_t *src = NULL;
 
-		  arm_rfft_fast_f32(&fft_instance, fft_input, fft_output, 0);
-		  arm_cmplx_mag_f32(fft_output, fft_mag, FFT_SIZE / 2);
+	if (half_complete) {
+	 half_complete = 0;
+	 src = &adc_buf[0];
+	} else if (full_complete) {
+	 full_complete = 0;
+	 src = &adc_buf[FFT_SIZE];   // assuming ADC_BUF_LEN = 2*FFT_SIZE
+	}
 
-		  //Find peak freq bin
-		  float max_val;
-		  uint32_t max_idx;
-		  arm_max_f32(fft_mag + 1, FFT_SIZE / 2 - 1, &max_val, &max_idx);
-		  max_idx += 1; //since we skip DC
+	if (src) {
+	 apply_hann_window(src, fft_input, FFT_SIZE);
+	 arm_rfft_fast_f32(&fft_instance, fft_input, fft_output, 0);
+	 arm_cmplx_mag_f32(fft_output, fft_mag, FFT_SIZE / 2);
 
-		  float freq = (float)max_idx * 100000.0f / FFT_SIZE; // sample at 100k (max for now)
+	 float max_val; uint32_t max_idx;
+	 arm_max_f32(fft_mag + 1, FFT_SIZE / 2 - 1, &max_val, &max_idx);
+	 max_idx += 1;
 
-		  char msg[64];
-		  sprintf(msg, "Peak: %.0f Hz, Mag: %.0f\r\n", freq, max_val);
-		  HAL_UART_Transmit(&huart3, (uint8_t*)msg, strlen(msg), 100);
-	  }
+	 float freq = (float)max_idx * 10000.0f / FFT_SIZE;
 
-	  if (full_complete) {
-		  full_complete = 0;
-		  char msg[32];
-		  sprintf(msg, "F: %u\r\n", adc_buf[512]);
-		  HAL_UART_Transmit(&huart3, (uint8_t*)msg, strlen(msg), 100);
-	  }
+	 static uint32_t last_tx = 0;
+	 if (HAL_GetTick() - last_tx > 200) {   // print ~5 Hz
+		 last_tx = HAL_GetTick();
+		 char msg[64];
+		 int n = snprintf(msg, sizeof msg, "Peak: %.0f Hz, Mag: %.0f\r\n", freq, max_val);
+		 HAL_UART_Transmit(&huart3, (uint8_t*)msg, n, 10);
+	 }
+}
+
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
@@ -277,7 +280,7 @@ static void MX_ADC1_Init(void)
   hadc1.Init.ExternalTrigConv = ADC_EXTERNALTRIG_T2_TRGO;
   hadc1.Init.ExternalTrigConvEdge = ADC_EXTERNALTRIGCONVEDGE_RISING;
   hadc1.Init.ConversionDataManagement = ADC_CONVERSIONDATA_DMA_CIRCULAR;
-  hadc1.Init.Overrun = ADC_OVR_DATA_PRESERVED;
+  hadc1.Init.Overrun = ADC_OVR_DATA_OVERWRITTEN;
   hadc1.Init.LeftBitShift = ADC_LEFTBITSHIFT_NONE;
   hadc1.Init.OversamplingMode = DISABLE;
   hadc1.Init.Oversampling.Ratio = 1;
@@ -298,7 +301,7 @@ static void MX_ADC1_Init(void)
   */
   sConfig.Channel = ADC_CHANNEL_16;
   sConfig.Rank = ADC_REGULAR_RANK_1;
-  sConfig.SamplingTime = ADC_SAMPLETIME_1CYCLE_5;
+  sConfig.SamplingTime = ADC_SAMPLETIME_16CYCLES_5;
   sConfig.SingleDiff = ADC_SINGLE_ENDED;
   sConfig.OffsetNumber = ADC_OFFSET_NONE;
   sConfig.Offset = 0;
@@ -334,7 +337,7 @@ static void MX_TIM2_Init(void)
   htim2.Instance = TIM2;
   htim2.Init.Prescaler = 63;
   htim2.Init.CounterMode = TIM_COUNTERMODE_UP;
-  htim2.Init.Period = 9;
+  htim2.Init.Period = 99; // lower sampling rate for debugging
   htim2.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
   htim2.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_ENABLE;
   if (HAL_TIM_Base_Init(&htim2) != HAL_OK)

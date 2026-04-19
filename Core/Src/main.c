@@ -21,6 +21,7 @@
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
+#include "arm_math.h"
 #include <stdio.h>
 #include <math.h>
 #include <string.h>
@@ -57,6 +58,10 @@ UART_HandleTypeDef huart3;
 
 #define FFT_SIZE 1024
 float fft_input[FFT_SIZE];
+
+arm_rfft_fast_instance_f32 fft_instance;
+float fft_output[FFT_SIZE];
+float fft_mag[FFT_SIZE / 2];
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -127,7 +132,12 @@ int main(void)
   __HAL_RCC_USART3_CLK_ENABLE();
   MX_USART_UART_Init();
   HAL_TIM_Base_Start(&htim2);
+  HAL_ADCEx_Calibration_Start(&hadc1, ADC_CALIB_OFFSET, ADC_SINGLE_ENDED);
   HAL_ADC_Start_DMA(&hadc1, (uint32_t*)adc_buf, ADC_BUF_LEN);
+  arm_rfft_fast_init_f32(&fft_instance, FFT_SIZE);
+
+  char *test = "UART OK\r\n";
+  HAL_UART_Transmit(&huart3, (uint8_t*)test, strlen(test), 100);
   /* USER CODE END 2 */
 
   /* Initialize leds */
@@ -142,11 +152,28 @@ int main(void)
   /* USER CODE BEGIN WHILE */
   while (1)
   {
+//	  if (half_complete) {
+//	      half_complete = 0;
+//	      char msg[] = "H\r\n";
+//	      HAL_UART_Transmit(&huart3, (uint8_t*)msg, 3, 100);
+//	  }
 	  if (half_complete) {
 		  half_complete = 0;
 		  apply_hann_window(adc_buf, fft_input, FFT_SIZE);
-		  char msg[32];
-		  sprintf(msg, "H: %u\r\n", adc_buf[0]);
+
+		  arm_rfft_fast_f32(&fft_instance, fft_input, fft_output, 0);
+		  arm_cmplx_mag_f32(fft_output, fft_mag, FFT_SIZE / 2);
+
+		  //Find peak freq bin
+		  float max_val;
+		  uint32_t max_idx;
+		  arm_max_f32(fft_mag + 1, FFT_SIZE / 2 - 1, &max_val, &max_idx);
+		  max_idx += 1; //since we skip DC
+
+		  float freq = (float)max_idx * 100000.0f / FFT_SIZE; // sample at 100k (max for now)
+
+		  char msg[64];
+		  sprintf(msg, "Peak: %.0f Hz, Mag: %.0f\r\n", freq, max_val);
 		  HAL_UART_Transmit(&huart3, (uint8_t*)msg, strlen(msg), 100);
 	  }
 

@@ -56,6 +56,10 @@ volatile uint32_t dma_half_count = 0;
 volatile uint32_t dma_full_count = 0;
 volatile uint16_t sample_seen_by_cpu = 0;
 volatile uint32_t avg_seen_by_cpu = 0;
+
+volatile uint16_t buf_min = 0;
+volatile uint16_t buf_max = 0;
+volatile uint16_t buf_p2p = 0;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -132,12 +136,17 @@ int main(void)
   /* USER CODE BEGIN WHILE */
   while (1)
   {
-	  sample_seen_by_cpu = adc_buffer[0];
-	  uint32_t sum = 0;
-	  for (int i = 0; i < 1024; ++i) {
-		  sum += adc_buffer[i];
+	  uint16_t lo = 0xFFFF, hi = 0;
+	  for (int i = 0; i < ADC_BUFFER_SIZE; ++i) {
+		  uint16_t v = adc_buffer[i];
+		  if (v < lo) lo = v;
+		  if (v > hi) hi = v;
 	  }
-	  avg_seen_by_cpu = sum /1024;
+	  buf_min = lo;
+	  buf_max = hi;
+	  buf_p2p = hi - lo;
+
+	  sample_seen_by_cpu = adc_buffer[0];
 
 	  HAL_GPIO_TogglePin(LED1_GPIO_PORT, LED1_PIN);
 	  HAL_Delay(200);

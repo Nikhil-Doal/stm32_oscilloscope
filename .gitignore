@@ -1,9 +1,28 @@
-Debug/
-Release/
+# STM32CubeIDE build output
+firmware/Debug/
+firmware/Release/
+
+# Compiled artifacts
 *.o
 *.d
 *.elf
 *.bin
 *.hex
-*.map
 *.list
+*.map
+*.su
+*.cyclo
+
+# Eclipse workspace metadata (user-specific)
+.metadata/
+
+# OS junk
+.DS_Store
+Thumbs.db
+
+# Python (host/)
+__pycache__/
+*.pyc
+.venv/
+venv/
+.pytest_cache/

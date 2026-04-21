@@ -43,17 +43,28 @@
 
 COM_InitTypeDef BspCOMInit;
 ADC_HandleTypeDef hadc1;
+DMA_HandleTypeDef hdma_adc1;
 
 /* USER CODE BEGIN PV */
 volatile uint32_t adc_value = 0;
+
+#define ADC_BUFFER_SIZE 4096
+__attribute__((section(".adc_buffer"), aligned(32)))
+uint16_t adc_buffer[ADC_BUFFER_SIZE];
+
+volatile uint32_t dma_half_count = 0;
+volatile uint32_t dma_full_count = 0;
+volatile uint16_t sample_seen_by_cpu = 0;
+volatile uint32_t avg_seen_by_cpu = 0;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
 void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
+static void MX_DMA_Init(void);
 static void MX_ADC1_Init(void);
 /* USER CODE BEGIN PFP */
-
+static void MPU_Config(void);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -69,7 +80,9 @@ int main(void)
 {
 
   /* USER CODE BEGIN 1 */
-
+	MPU_Config();
+	SCB_EnableICache();
+	SCB_EnableDCache();
   /* USER CODE END 1 */
 
   /* MCU Configuration--------------------------------------------------------*/
@@ -90,9 +103,10 @@ int main(void)
 
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
+  MX_DMA_Init();
   MX_ADC1_Init();
   /* USER CODE BEGIN 2 */
-
+  HAL_ADC_Start_DMA(&hadc1, (uint32_t*)adc_buffer, ADC_BUFFER_SIZE);
   /* USER CODE END 2 */
 
   /* Initialize leds */
@@ -118,11 +132,12 @@ int main(void)
   /* USER CODE BEGIN WHILE */
   while (1)
   {
-	  HAL_ADC_Start(&hadc1);
-	  if (HAL_ADC_PollForConversion(&hadc1, 10) == HAL_OK) {
-		  adc_value = HAL_ADC_GetValue(&hadc1);
+	  sample_seen_by_cpu = adc_buffer[0];
+	  uint32_t sum = 0;
+	  for (int i = 0; i < 1024; ++i) {
+		  sum += adc_buffer[i];
 	  }
-	  HAL_ADC_Stop(&hadc1);
+	  avg_seen_by_cpu = sum /1024;
 
 	  HAL_GPIO_TogglePin(LED1_GPIO_PORT, LED1_PIN);
 	  HAL_Delay(200);
@@ -209,17 +224,17 @@ static void MX_ADC1_Init(void)
   /** Common config
   */
   hadc1.Instance = ADC1;
-  hadc1.Init.ClockPrescaler = ADC_CLOCK_ASYNC_DIV4;
+  hadc1.Init.ClockPrescaler = ADC_CLOCK_ASYNC_DIV2;
   hadc1.Init.Resolution = ADC_RESOLUTION_16B;
   hadc1.Init.ScanConvMode = ADC_SCAN_DISABLE;
   hadc1.Init.EOCSelection = ADC_EOC_SINGLE_CONV;
   hadc1.Init.LowPowerAutoWait = DISABLE;
-  hadc1.Init.ContinuousConvMode = DISABLE;
+  hadc1.Init.ContinuousConvMode = ENABLE;
   hadc1.Init.NbrOfConversion = 1;
   hadc1.Init.DiscontinuousConvMode = DISABLE;
   hadc1.Init.ExternalTrigConv = ADC_SOFTWARE_START;
   hadc1.Init.ExternalTrigConvEdge = ADC_EXTERNALTRIGCONVEDGE_NONE;
-  hadc1.Init.ConversionDataManagement = ADC_CONVERSIONDATA_DR;
+  hadc1.Init.ConversionDataManagement = ADC_CONVERSIONDATA_DMA_CIRCULAR;
   hadc1.Init.Overrun = ADC_OVR_DATA_PRESERVED;
   hadc1.Init.LeftBitShift = ADC_LEFTBITSHIFT_NONE;
   hadc1.Init.OversamplingMode = DISABLE;
@@ -257,6 +272,22 @@ static void MX_ADC1_Init(void)
 }
 
 /**
+  * Enable DMA controller clock
+  */
+static void MX_DMA_Init(void)
+{
+
+  /* DMA controller clock enable */
+  __HAL_RCC_DMA1_CLK_ENABLE();
+
+  /* DMA interrupt init */
+  /* DMA1_Stream0_IRQn interrupt configuration */
+  HAL_NVIC_SetPriority(DMA1_Stream0_IRQn, 0, 0);
+  HAL_NVIC_EnableIRQ(DMA1_Stream0_IRQn);
+
+}
+
+/**
   * @brief GPIO Initialization Function
   * @param None
   * @retval None
@@ -278,7 +309,34 @@ static void MX_GPIO_Init(void)
 }
 
 /* USER CODE BEGIN 4 */
+void HAL_ADC_ConvHalfCpltCallback(ADC_HandleTypeDef *hadc) {
+    dma_half_count++;
+}
+void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef *hadc) {
+    dma_full_count++;
+}
 
+extern uint32_t _sadc_buffer;
+static void MPU_Config(void) {
+	MPU_Region_InitTypeDef mpu = {0};
+	HAL_MPU_Disable();
+
+	mpu.Enable           = MPU_REGION_ENABLE;
+	mpu.Number           = MPU_REGION_NUMBER0;
+	mpu.BaseAddress      = (uint32_t)&_sadc_buffer;
+	mpu.Size             = MPU_REGION_SIZE_8KB;
+	mpu.AccessPermission = MPU_REGION_FULL_ACCESS;
+	mpu.IsBufferable     = MPU_ACCESS_BUFFERABLE;
+	mpu.IsCacheable      = MPU_ACCESS_NOT_CACHEABLE;
+	mpu.IsShareable      = MPU_ACCESS_SHAREABLE;
+	mpu.TypeExtField     = MPU_TEX_LEVEL0;
+	mpu.SubRegionDisable = 0x00;
+	mpu.DisableExec      = MPU_INSTRUCTION_ACCESS_DISABLE;
+
+	HAL_MPU_ConfigRegion(&mpu);
+	HAL_MPU_Enable(MPU_PRIVILEGED_DEFAULT);
+
+}
 /* USER CODE END 4 */
 
 /**

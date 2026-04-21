@@ -139,6 +139,15 @@ SECTIONS
     _edata = .;        /* define a global symbol at data end */
   } >RAM_D1 AT> FLASH
 
+  .adc_buffer (NOLOAD) :
+  {
+    . = ALIGN(32);
+    _sadc_buffer = .;
+    KEEP(*(.adc_buffer))
+    . = ALIGN(32);
+    _eadc_buffer = .;
+  } >RAM_D1
+
   /* Uninitialized data section */
   . = ALIGN(4);
   .bss :

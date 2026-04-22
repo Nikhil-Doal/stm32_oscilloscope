@@ -18,6 +18,8 @@
 /* USER CODE END Header */
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
+#include "FreeRTOS.h"
+#include "cmsis_os2.h"
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
@@ -45,6 +47,13 @@ COM_InitTypeDef BspCOMInit;
 ADC_HandleTypeDef hadc1;
 DMA_HandleTypeDef hdma_adc1;
 
+/* Definitions for defaultTask */
+osThreadId_t defaultTaskHandle;
+const osThreadAttr_t defaultTask_attributes = {
+  .name = "defaultTask",
+  .stack_size = 128 * 4,
+  .priority = (osPriority_t) osPriorityNormal,
+};
 /* USER CODE BEGIN PV */
 volatile uint32_t adc_value = 0;
 
@@ -78,6 +87,35 @@ volatile uint32_t measured_sample_rate = 0;
 
 volatile uint32_t sys_clock_hz = 0;
 volatile uint32_t hclk_hz = 0;
+
+// Primitives for FreeRTOS
+osSemaphoreId_t adcDataSemaphore;
+osMessageQueueId_t adcQueue;
+
+// Task handles
+osThreadId_t acquisitionTaskHandle;
+osThreadId_t processingTaskHandle;
+
+// Shared state (processing to comms), raw peak bin/mag, protect later with mutex
+typedef struct {
+    uint32_t peak_bin;
+    float32_t peak_magnitude;
+    uint32_t timestamp_tick;
+} ProcessingResults_t;
+
+volatile ProcessingResults_t latest_results;
+
+// message for queue, tell which half of buffer is ready
+typedef enum {
+	BUFFER_HALF_FIRST = 0,
+	BUFFER_HALF_SECOND = 1,
+} BufferHalf_t;
+
+// Task health counters
+volatile uint32_t acq_task_runs = 0;
+volatile uint32_t proc_task_runs = 0;
+volatile uint32_t coms_task_runs = 0;
+
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -85,8 +123,12 @@ void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
 static void MX_DMA_Init(void);
 static void MX_ADC1_Init(void);
+void StartDefaultTask(void *argument);
+
 /* USER CODE BEGIN PFP */
 static void MPU_Config(void);
+static void AcquisitionTask(void *argument);
+static void ProcessingTask(void *argument);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -136,6 +178,52 @@ int main(void)
   hclk_hz = HAL_RCC_GetHCLKFreq();
   /* USER CODE END 2 */
 
+  /* Init scheduler */
+  osKernelInitialize();
+
+  /* USER CODE BEGIN RTOS_MUTEX */
+  /* add mutexes, ... */
+  /* USER CODE END RTOS_MUTEX */
+
+  /* USER CODE BEGIN RTOS_SEMAPHORES */
+  /* add semaphores, ... */
+  adcDataSemaphore = osSemaphoreNew(4, 0, NULL);
+  /* USER CODE END RTOS_SEMAPHORES */
+
+  /* USER CODE BEGIN RTOS_TIMERS */
+  /* start timers, add new ones, ... */
+  /* USER CODE END RTOS_TIMERS */
+
+  /* USER CODE BEGIN RTOS_QUEUES */
+  /* add queues, ... */
+  adcQueue = osMessageQueueNew(8, sizeof(BufferHalf_t), NULL);
+  /* USER CODE END RTOS_QUEUES */
+
+  /* Create the thread(s) */
+  /* creation of defaultTask */
+  defaultTaskHandle = osThreadNew(StartDefaultTask, NULL, &defaultTask_attributes);
+
+  /* USER CODE BEGIN RTOS_THREADS */
+  /* add threads, ... */
+  const osThreadAttr_t acq_attr = {
+		  .name = "AcqTask",
+		  .stack_size = 1024,
+		  .priority = (osPriority_t)osPriorityHigh,
+  };
+  acquisitionTaskHandle = osThreadNew(AcquisitionTask, NULL, &acq_attr);
+
+  const osThreadAttr_t proc_attr = {
+		  .name = "ProcTask",
+		  .stack_size = 2048, // fft needs some stack
+		  .priority = (osPriority_t)osPriorityNormal,
+  };
+  processingTaskHandle = osThreadNew(ProcessingTask, NULL, &proc_attr);
+  /* USER CODE END RTOS_THREADS */
+
+  /* USER CODE BEGIN RTOS_EVENTS */
+  /* add events, ... */
+  /* USER CODE END RTOS_EVENTS */
+
   /* Initialize leds */
   BSP_LED_Init(LED_GREEN);
   BSP_LED_Init(LED_YELLOW);
@@ -154,6 +242,11 @@ int main(void)
   {
     Error_Handler();
   }
+
+  /* Start scheduler */
+  osKernelStart();
+
+  /* We should never get here as control is now taken by the scheduler */
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
@@ -346,7 +439,7 @@ static void MX_DMA_Init(void)
 
   /* DMA interrupt init */
   /* DMA1_Stream0_IRQn interrupt configuration */
-  HAL_NVIC_SetPriority(DMA1_Stream0_IRQn, 0, 0);
+  HAL_NVIC_SetPriority(DMA1_Stream0_IRQn, 5, 0);
   HAL_NVIC_EnableIRQ(DMA1_Stream0_IRQn);
 
 }
@@ -375,9 +468,76 @@ static void MX_GPIO_Init(void)
 /* USER CODE BEGIN 4 */
 void HAL_ADC_ConvHalfCpltCallback(ADC_HandleTypeDef *hadc) {
     dma_half_count++;
+    /* First half of buffer is fresh. Give semaphore to wake acquisition task. */
+    if (adcDataSemaphore != NULL) {
+        osSemaphoreRelease(adcDataSemaphore);
+    }
 }
+
 void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef *hadc) {
     dma_full_count++;
+    /* Second half of buffer is fresh. */
+    if (adcDataSemaphore != NULL) {
+        osSemaphoreRelease(adcDataSemaphore);
+    }
+}
+
+static void AcquisitionTask(void *argument) {
+    BufferHalf_t next_half = BUFFER_HALF_FIRST;
+
+    for (;;) {
+        // Block until DMA callback gives semaphore
+        osSemaphoreAcquire(adcDataSemaphore, osWaitForever);
+
+        // Post which half is now fresh to the processing queue
+        osMessageQueuePut(adcQueue, &next_half, 0U, 0U);
+
+        // Alternate for next iteration
+        next_half = (next_half == BUFFER_HALF_FIRST) ? BUFFER_HALF_SECOND : BUFFER_HALF_FIRST;
+
+        acq_task_runs++;
+    }
+}
+
+static void ProcessingTask(void *argument) {
+    BufferHalf_t half;
+
+    for (;;) {
+        // Block until acquisition task posts
+        if (osMessageQueueGet(adcQueue, &half, NULL, osWaitForever) != osOK) {
+            continue;
+        }
+
+        // Determine which 2048-sample slice to run FFT over. We still FFT only FFT_SIZE (1024)
+        // samples from the start of that half for consistency with earlier behavior.
+        uint16_t *src = (half == BUFFER_HALF_FIRST) ? &adc_buffer[0] : &adc_buffer[ADC_BUFFER_SIZE / 2];
+
+        for (int i = 0; i < FFT_SIZE; i++) {
+            fft_input[i] = (float32_t)src[i] - 32768.0f;
+        }
+        arm_rfft_fast_f32(&fft_inst, fft_input, fft_output, 0);
+        arm_cmplx_mag_f32(fft_output, fft_magnitudes, FFT_SIZE / 2);
+
+        dc_magnitude = fft_magnitudes[0];
+        uint32_t best_bin = 1;
+        float32_t best_mag = 0.0f;
+        for (uint32_t i = 2; i < FFT_SIZE / 2; i++) {
+            if (fft_magnitudes[i] > best_mag) {
+                best_mag = fft_magnitudes[i];
+                best_bin = i;
+            }
+        }
+
+        peak_bin = best_bin;
+        peak_magnitude = best_mag;
+
+        // Publish to shared struct (will be mutex-protected later)
+        latest_results.peak_bin = best_bin;
+        latest_results.peak_magnitude = best_mag;
+        latest_results.timestamp_tick = osKernelGetTickCount();
+
+        proc_task_runs++;
+    }
 }
 
 extern uint32_t _sadc_buffer;
@@ -402,6 +562,60 @@ static void MPU_Config(void) {
 
 }
 /* USER CODE END 4 */
+
+/* USER CODE BEGIN Header_StartDefaultTask */
+/**
+  * @brief  Function implementing the defaultTask thread.
+  * @param  argument: Not used
+  * @retval None
+  */
+/* USER CODE END Header_StartDefaultTask */
+void StartDefaultTask(void *argument)
+{
+  /* USER CODE BEGIN 5 */
+  static uint32_t last_full_count = 0;
+  static uint32_t last_tick = 0;
+  /* Infinite loop */
+  for(;;)
+  {
+	  // We will keep it at 30Hz for now, for sample rate
+	  uint32_t now = osKernelGetTickCount();
+	  if (now - last_tick >= 1000) {
+		  uint32_t delta = dma_full_count - last_full_count;
+		  measured_sample_rate = delta * ADC_BUFFER_SIZE;
+		  last_full_count = dma_full_count;
+		  last_tick = now;
+	  }
+
+	  HAL_GPIO_TogglePin(LED1_GPIO_PORT, LED1_PIN);
+	  coms_task_runs++;
+
+	  osDelay(33);
+  }
+  /* USER CODE END 5 */
+}
+
+/**
+  * @brief  Period elapsed callback in non blocking mode
+  * @note   This function is called  when TIM6 interrupt took place, inside
+  * HAL_TIM_IRQHandler(). It makes a direct call to HAL_IncTick() to increment
+  * a global variable "uwTick" used as application time base.
+  * @param  htim : TIM handle
+  * @retval None
+  */
+void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
+{
+  /* USER CODE BEGIN Callback 0 */
+
+  /* USER CODE END Callback 0 */
+  if (htim->Instance == TIM6)
+  {
+    HAL_IncTick();
+  }
+  /* USER CODE BEGIN Callback 1 */
+
+  /* USER CODE END Callback 1 */
+}
 
 /**
   * @brief  This function is executed in case of error occurrence.

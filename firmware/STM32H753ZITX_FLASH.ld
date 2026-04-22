@@ -141,10 +141,10 @@ SECTIONS
 
   .adc_buffer (NOLOAD) :
   {
-    . = ALIGN(32);
+    . = ALIGN(8192);
     _sadc_buffer = .;
     KEEP(*(.adc_buffer))
-    . = ALIGN(32);
+    . = ALIGN(8192);
     _eadc_buffer = .;
   } >RAM_D1
 

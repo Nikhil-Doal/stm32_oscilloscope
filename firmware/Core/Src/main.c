@@ -20,10 +20,12 @@
 #include "main.h"
 #include "FreeRTOS.h"
 #include "cmsis_os2.h"
+#include "usb_device.h"
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 #include "arm_math.h"
+#include "usbd_cdc_if.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -51,7 +53,7 @@ DMA_HandleTypeDef hdma_adc1;
 osThreadId_t defaultTaskHandle;
 const osThreadAttr_t defaultTask_attributes = {
   .name = "defaultTask",
-  .stack_size = 128 * 4,
+  .stack_size = 256 * 4,
   .priority = (osPriority_t) osPriorityNormal,
 };
 /* USER CODE BEGIN PV */
@@ -214,7 +216,7 @@ int main(void)
 
   const osThreadAttr_t proc_attr = {
 		  .name = "ProcTask",
-		  .stack_size = 2048, // fft needs some stack
+		  .stack_size = 4096, // fft needs some stack
 		  .priority = (osPriority_t)osPriorityNormal,
   };
   processingTaskHandle = osThreadNew(ProcessingTask, NULL, &proc_attr);
@@ -322,9 +324,10 @@ void SystemClock_Config(void)
   /** Initializes the RCC Oscillators according to the specified parameters
   * in the RCC_OscInitTypeDef structure.
   */
-  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSI;
+  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSI48|RCC_OSCILLATORTYPE_HSI;
   RCC_OscInitStruct.HSIState = RCC_HSI_DIV1;
   RCC_OscInitStruct.HSICalibrationValue = RCC_HSICALIBRATION_DEFAULT;
+  RCC_OscInitStruct.HSI48State = RCC_HSI48_ON;
   RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
   RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSI;
   RCC_OscInitStruct.PLL.PLLM = 4;
@@ -572,9 +575,13 @@ static void MPU_Config(void) {
 /* USER CODE END Header_StartDefaultTask */
 void StartDefaultTask(void *argument)
 {
+  /* init code for USB_DEVICE */
+  MX_USB_DEVICE_Init();
   /* USER CODE BEGIN 5 */
   static uint32_t last_full_count = 0;
   static uint32_t last_tick = 0;
+  static uint32_t last_tx = 0;
+  char tx_buf[128];
   /* Infinite loop */
   for(;;)
   {
@@ -585,6 +592,20 @@ void StartDefaultTask(void *argument)
 		  measured_sample_rate = delta * ADC_BUFFER_SIZE;
 		  last_full_count = dma_full_count;
 		  last_tick = now;
+	  }
+
+	  // Heartbeat over USB CDC every 500ms
+	  if (now - last_tx >= 500) {
+	      int n = snprintf(tx_buf, sizeof(tx_buf),
+	          "tick=%lu Fs=%lu peak_bin=%lu peak_mag=%.0f\r\n",
+	          now,
+	          measured_sample_rate,
+	          latest_results.peak_bin,
+	          latest_results.peak_magnitude);
+	      if (n > 0) {
+	          CDC_Transmit_FS((uint8_t *)tx_buf, (uint16_t)n);
+	      }
+	      last_tx = now;
 	  }
 
 	  HAL_GPIO_TogglePin(LED1_GPIO_PORT, LED1_PIN);

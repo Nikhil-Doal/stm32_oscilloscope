@@ -21,7 +21,7 @@
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
-
+#include "arm_math.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -60,6 +60,22 @@ volatile uint32_t avg_seen_by_cpu = 0;
 volatile uint16_t buf_min = 0;
 volatile uint16_t buf_max = 0;
 volatile uint16_t buf_p2p = 0;
+
+#define FFT_SIZE 1024
+
+// FFT buffers (can stay in cacheable memory as only DMA buffer needs MPU)
+static float32_t fft_input[FFT_SIZE];
+static float32_t fft_output[FFT_SIZE]; // [r0, i0, r1, i1 ...]
+static float32_t fft_magnitudes[FFT_SIZE / 2]; // half-spectrum, real to conjugate symmetric
+
+static arm_rfft_fast_instance_f32 fft_inst;
+
+// debugger values for testing
+volatile uint32_t peak_bin = 0;
+volatile float32_t peak_magnitude = 0.0f;
+volatile float32_t dc_magnitude = 0.0f;
+
+volatile uint32_t measured_sample_rate = 0;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -111,6 +127,9 @@ int main(void)
   MX_ADC1_Init();
   /* USER CODE BEGIN 2 */
   HAL_ADC_Start_DMA(&hadc1, (uint32_t*)adc_buffer, ADC_BUFFER_SIZE);
+  if (arm_rfft_fast_init_f32(&fft_inst, FFT_SIZE) != ARM_MATH_SUCCESS) {
+	  Error_Handler();
+  }
   /* USER CODE END 2 */
 
   /* Initialize leds */
@@ -136,17 +155,44 @@ int main(void)
   /* USER CODE BEGIN WHILE */
   while (1)
   {
-	  uint16_t lo = 0xFFFF, hi = 0;
-	  for (int i = 0; i < ADC_BUFFER_SIZE; ++i) {
-		  uint16_t v = adc_buffer[i];
-		  if (v < lo) lo = v;
-		  if (v > hi) hi = v;
+	  // copy and convert adc samples (16 bit) to f32
+	  // we can subtract 32768 to make 0 mean, so DC bin doesnt dominate
+	  for (int i = 0; i < FFT_SIZE; ++i) {
+		fft_input[i] = (float32_t)adc_buffer[i] - 32768.0f;
 	  }
-	  buf_min = lo;
-	  buf_max = hi;
-	  buf_p2p = hi - lo;
 
-	  sample_seen_by_cpu = adc_buffer[0];
+	  // foward Real FFT, i.e input to output (with complex interleaved)
+	  arm_rfft_fast_f32(&fft_inst, fft_input, fft_output, 0);
+
+	  // compute the magnitude of each complex bin
+	  // output has FFT_SIZE/2 pairs, we skip Nyquist
+	  arm_cmplx_mag_f32(fft_output, fft_magnitudes, FFT_SIZE / 2);
+
+	  // now we find the peak, skip bin 0 and start at bin 2
+	  // prevents leakage
+	  dc_magnitude = fft_magnitudes[0];
+	  uint32_t best_bin = 1;
+	  float32_t best_mag = 0.0f;
+
+	  for (uint32_t i = 2; i < FFT_SIZE/2; ++i) {
+		  if (fft_magnitudes[i] > best_mag) {
+			  best_mag = fft_magnitudes[i];
+			  best_bin = i;
+		  }
+	  }
+
+	  peak_bin = best_bin;
+	  peak_magnitude = best_mag;
+
+	  static uint32_t last_full_count = 0;
+	  static uint32_t last_tick = 0;
+	  uint32_t now = HAL_GetTick();
+	  if (now - last_tick >= 1000) {
+	      uint32_t delta = dma_full_count - last_full_count;
+	      measured_sample_rate = delta * ADC_BUFFER_SIZE;
+	      last_full_count = dma_full_count;
+	      last_tick = now;
+	  }
 
 	  HAL_GPIO_TogglePin(LED1_GPIO_PORT, LED1_PIN);
 	  HAL_Delay(200);

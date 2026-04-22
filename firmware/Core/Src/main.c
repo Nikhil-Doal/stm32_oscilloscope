@@ -26,6 +26,8 @@
 /* USER CODE BEGIN Includes */
 #include "arm_math.h"
 #include "usbd_cdc_if.h"
+#include <string.h>
+#include <stdbool.h>
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -35,6 +37,20 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
+#define FRAME_SYNC_0 0xAA
+#define FRAME_SYNC_1 0x55
+#define FRAME_TYPE_WAVEFORM 0x01
+
+#define WAVEFORM_SAMPLES 2048 // half of DMA buffer
+#define MAG_BINS (FFT_SIZE / 2) // 512
+
+// payload = 16 byte header + samples + magnitudes
+#define PAYLOAD_HDR_BYTES 16
+#define PAYLOAD_BYTES (PAYLOAD_HDR_BYTES + WAVEFORM_SAMPLES * 2 + MAG_BINS * 4)
+
+// full frame is 2 sync + 1 type + 2 length + payload + crc = 7
+#define FRAME_OVERHEAD 7
+#define FRAME_TOTAL_BYTES (FRAME_OVERHEAD + PAYLOAD_BYTES)
 
 /* USER CODE END PD */
 
@@ -118,6 +134,15 @@ volatile uint32_t acq_task_runs = 0;
 volatile uint32_t proc_task_runs = 0;
 volatile uint32_t coms_task_runs = 0;
 
+// binary frame buffer 6167 bytes - too big for task stack so we make it static global
+static uint8_t frame_buffer[FRAME_TOTAL_BYTES];
+
+// usb transmit stats for debugging
+volatile uint32_t usb_tx_ok = 0;
+volatile uint32_t usb_tx_busy_drops = 0;
+
+static uint16_t latest_samples[WAVEFORM_SAMPLES];
+static float32_t latest_magnitudes[MAG_BINS];
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -131,6 +156,7 @@ void StartDefaultTask(void *argument);
 static void MPU_Config(void);
 static void AcquisitionTask(void *argument);
 static void ProcessingTask(void *argument);
+static bool build_and_send_frame(void);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -534,6 +560,9 @@ static void ProcessingTask(void *argument) {
         peak_bin = best_bin;
         peak_magnitude = best_mag;
 
+        memcpy(latest_samples, src, WAVEFORM_SAMPLES * sizeof(uint16_t));
+        memcpy(latest_magnitudes, fft_magnitudes, MAG_BINS * sizeof(float32_t));
+
         // Publish to shared struct (will be mutex-protected later)
         latest_results.peak_bin = best_bin;
         latest_results.peak_magnitude = best_mag;
@@ -564,6 +593,69 @@ static void MPU_Config(void) {
 	HAL_MPU_Enable(MPU_PRIVILEGED_DEFAULT);
 
 }
+
+// CRC16-CCITT, use crcmod library in Python
+static uint16_t crc16_ccitt(const uint8_t *data, size_t len) {
+    uint16_t crc = 0xFFFF;
+    for (size_t i = 0; i < len; i++) {
+        crc ^= ((uint16_t)data[i]) << 8;
+        for (int b = 0; b < 8; b++) {
+            if (crc & 0x8000) {
+                crc = (crc << 1) ^ 0x1021;
+            } else {
+                crc <<= 1;
+            }
+        }
+    }
+    return crc;
+}
+
+static bool build_and_send_frame(void) {
+    uint8_t *p = frame_buffer;
+
+    /* Sync + header */
+    *p++ = FRAME_SYNC_0;
+    *p++ = FRAME_SYNC_1;
+    *p++ = FRAME_TYPE_WAVEFORM;
+    *p++ = (uint8_t)(PAYLOAD_BYTES & 0xFF);
+    *p++ = (uint8_t)((PAYLOAD_BYTES >> 8) & 0xFF);
+
+    /* Payload: 16-byte header */
+    uint8_t *crc_start = p - 3;      /* type + length */
+    uint32_t tick = osKernelGetTickCount();
+    uint32_t fs = measured_sample_rate;
+    uint32_t pbin = latest_results.peak_bin;
+    float32_t pmag = latest_results.peak_magnitude;
+
+    memcpy(p, &tick, 4);   p += 4;
+    memcpy(p, &fs,   4);   p += 4;
+    memcpy(p, &pbin, 4);   p += 4;
+    memcpy(p, &pmag, 4);   p += 4;
+
+    /* Payload: waveform samples */
+    memcpy(p, latest_samples, WAVEFORM_SAMPLES * sizeof(uint16_t));
+    p += WAVEFORM_SAMPLES * sizeof(uint16_t);
+
+    /* Payload: magnitudes */
+    memcpy(p, latest_magnitudes, MAG_BINS * sizeof(float32_t));
+    p += MAG_BINS * sizeof(float32_t);
+
+    /* CRC over [type + length + payload] */
+    size_t crc_len = (size_t)(p - crc_start);
+    uint16_t crc = crc16_ccitt(crc_start, crc_len);
+    *p++ = (uint8_t)(crc & 0xFF);
+    *p++ = (uint8_t)((crc >> 8) & 0xFF);
+
+    /* Attempt transmit — CDC is non-blocking, may return USBD_BUSY */
+    uint8_t result = CDC_Transmit_FS(frame_buffer, FRAME_TOTAL_BYTES);
+    if (result == USBD_OK) {
+        usb_tx_ok++;
+        return true;
+    } else {
+        usb_tx_busy_drops++;
+        return false;
+    }
+}
 /* USER CODE END 4 */
 
 /* USER CODE BEGIN Header_StartDefaultTask */
@@ -580,12 +672,11 @@ void StartDefaultTask(void *argument)
   /* USER CODE BEGIN 5 */
   static uint32_t last_full_count = 0;
   static uint32_t last_tick = 0;
-  static uint32_t last_tx = 0;
-  char tx_buf[128];
+
+  osDelay(2000); // ~2seconds wait
   /* Infinite loop */
   for(;;)
   {
-	  // We will keep it at 30Hz for now, for sample rate
 	  uint32_t now = osKernelGetTickCount();
 	  if (now - last_tick >= 1000) {
 		  uint32_t delta = dma_full_count - last_full_count;
@@ -594,19 +685,7 @@ void StartDefaultTask(void *argument)
 		  last_tick = now;
 	  }
 
-	  // Heartbeat over USB CDC every 500ms
-	  if (now - last_tx >= 500) {
-	      int n = snprintf(tx_buf, sizeof(tx_buf),
-	          "tick=%lu Fs=%lu peak_bin=%lu peak_mag=%.0f\r\n",
-	          now,
-	          measured_sample_rate,
-	          latest_results.peak_bin,
-	          latest_results.peak_magnitude);
-	      if (n > 0) {
-	          CDC_Transmit_FS((uint8_t *)tx_buf, (uint16_t)n);
-	      }
-	      last_tx = now;
-	  }
+	  build_and_send_frame();
 
 	  HAL_GPIO_TogglePin(LED1_GPIO_PORT, LED1_PIN);
 	  coms_task_runs++;

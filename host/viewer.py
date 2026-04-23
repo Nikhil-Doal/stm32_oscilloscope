@@ -186,7 +186,7 @@ class Viewer(QtWidgets.QMainWindow):
 
         # Display state
         self.db_scale = False
-        self.trigger_enabled = True
+        self.trigger_enabled = False
         self.trigger_level = 32768  # midpoint of uint16, auto-initialized after first frame
 
         # ---- Layout: top bar, plots, bottom bar ----
@@ -213,7 +213,7 @@ class Viewer(QtWidgets.QMainWindow):
 
         self.trigger_btn = QtWidgets.QPushButton("Trigger")
         self.trigger_btn.setCheckable(True)
-        self.trigger_btn.setChecked(True)
+        self.trigger_btn.setChecked(False)
         self.trigger_btn.toggled.connect(self._on_trigger_toggled)
         top_row.addWidget(self.trigger_btn)
 

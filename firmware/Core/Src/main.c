@@ -60,7 +60,6 @@
 /* USER CODE END PM */
 
 /* Private variables ---------------------------------------------------------*/
-
 COM_InitTypeDef BspCOMInit;
 ADC_HandleTypeDef hadc1;
 DMA_HandleTypeDef hdma_adc1;
@@ -75,6 +74,9 @@ const osThreadAttr_t defaultTask_attributes = {
 /* USER CODE BEGIN PV */
 #define ADC_BUFFER_SIZE 4096
 #define FFT_SIZE 1024
+
+#define HANN_SIZE FFT_SIZE
+static float32_t hann_window[HANN_SIZE];
 
 __attribute__((section(".adc_buffer"), aligned(32)))
 uint16_t adc_buffer[ADC_BUFFER_SIZE];
@@ -181,6 +183,9 @@ int main(void)
   HAL_ADC_Start_DMA(&hadc1, (uint32_t*)adc_buffer, ADC_BUFFER_SIZE);
   if (arm_rfft_fast_init_f32(&fft_inst, FFT_SIZE) != ARM_MATH_SUCCESS) {
 	  Error_Handler();
+  }
+  for (int n = 0; n < HANN_SIZE; n++) {
+      hann_window[n] = 0.5f * (1.0f - cosf(2.0f * 3.14159265358979f * (float)n / (float)(HANN_SIZE - 1)));
   }
   /* USER CODE END 2 */
 
@@ -477,7 +482,7 @@ static void ProcessingTask(void *argument) {
         uint16_t *src = (half == BUFFER_HALF_FIRST) ? &adc_buffer[0] : &adc_buffer[ADC_BUFFER_SIZE / 2];
 
         for (int i = 0; i < FFT_SIZE; i++) {
-            fft_input[i] = (float32_t)src[i] - 32768.0f;
+        	fft_input[i] = ((float32_t)src[i] - 32768.0f) * hann_window[i];;
         }
         arm_rfft_fast_f32(&fft_inst, fft_input, fft_output, 0);
         arm_cmplx_mag_f32(fft_output, fft_magnitudes, FFT_SIZE / 2);

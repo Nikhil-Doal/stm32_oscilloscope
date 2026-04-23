@@ -1,11 +1,9 @@
-# parsing
 import struct
 import sys
 import time
 import threading
-from collections import deque
 from dataclasses import dataclass
-# plotting
+
 import numpy as np
 import serial
 import pyqtgraph as pg
@@ -20,11 +18,12 @@ WAVEFORM_SAMPLES = 2048
 MAG_BINS = 512
 
 PAYLOAD_HDR_BYTES = 16
-PAYLOAD_BYTES = PAYLOAD_HDR_BYTES + WAVEFORM_SAMPLES * 2 + MAG_BINS * 4  # 6160
-FRAME_OVERHEAD = 7  # 2 sync + 1 type + 2 len + 2 crc
-FRAME_TOTAL = FRAME_OVERHEAD + PAYLOAD_BYTES  # 6167
+PAYLOAD_BYTES = PAYLOAD_HDR_BYTES + WAVEFORM_SAMPLES * 2 + MAG_BINS * 4
+FRAME_OVERHEAD = 7
+FRAME_TOTAL = FRAME_OVERHEAD + PAYLOAD_BYTES
 
 PORT = "COM3"
+
 
 # --- CRC16-CCITT (polynomial 0x1021, init 0xFFFF) ---------------------------
 def crc16_ccitt(data: bytes) -> int:
@@ -38,20 +37,19 @@ def crc16_ccitt(data: bytes) -> int:
                 crc = (crc << 1) & 0xFFFF
     return crc
 
-# --- Parsed frame structure -------------------------------------------------
 
+# --- Parsed frame structure -------------------------------------------------
 @dataclass
 class Frame:
     tick_ms: int
     sample_rate_hz: int
     peak_bin: int
     peak_mag: float
-    samples: np.ndarray       # uint16 shape (2048,)
-    magnitudes: np.ndarray    # float32 shape (512,)
+    samples: np.ndarray
+    magnitudes: np.ndarray
 
 
 # --- Streaming parser: feed bytes, get frames ------------------------------
-
 class FrameParser:
     def __init__(self):
         self.buf = bytearray()
@@ -67,25 +65,19 @@ class FrameParser:
             yield frame
 
     def _try_parse_one(self):
-        # Find sync bytes
         while len(self.buf) >= 2:
             if self.buf[0] == SYNC_0 and self.buf[1] == SYNC_1:
                 break
-            # Discard one byte and try again
             del self.buf[0]
 
-        # Need full frame
         if len(self.buf) < FRAME_TOTAL:
             return None
 
-        # Extract length and sanity check
         payload_len = self.buf[3] | (self.buf[4] << 8)
         if payload_len != PAYLOAD_BYTES:
-            # Length mismatch - sync was false positive, skip one byte and retry
             del self.buf[0]
             return None
 
-        # Validate CRC (over type + length + payload, NOT sync)
         crc_region = bytes(self.buf[2:2 + 3 + PAYLOAD_BYTES])
         crc_received = self.buf[FRAME_TOTAL - 2] | (self.buf[FRAME_TOTAL - 1] << 8)
         crc_expected = crc16_ccitt(crc_region)
@@ -95,8 +87,7 @@ class FrameParser:
             del self.buf[0]
             return None
 
-        # Parse payload
-        off = 5  # skip sync + type + len
+        off = 5
         tick, fs, peak_bin = struct.unpack_from("<III", self.buf, off)
         peak_mag, = struct.unpack_from("<f", self.buf, off + 12)
 
@@ -105,7 +96,7 @@ class FrameParser:
             self.buf, dtype=np.uint16,
             count=WAVEFORM_SAMPLES,
             offset=samples_off,
-        ).copy()  # copy so we can discard buf
+        ).copy()
 
         mags_off = samples_off + WAVEFORM_SAMPLES * 2
         mags = np.frombuffer(
@@ -114,7 +105,6 @@ class FrameParser:
             offset=mags_off,
         ).copy()
 
-        # Consume frame
         del self.buf[:FRAME_TOTAL]
         self.frames_parsed += 1
 
@@ -129,7 +119,6 @@ class FrameParser:
 
 
 # --- Serial reader thread ---------------------------------------------------
-
 class SerialReader(threading.Thread):
     def __init__(self, port: str, frame_callback):
         super().__init__(daemon=True)
@@ -163,30 +152,49 @@ class SerialReader(threading.Thread):
         self.running = False
 
 
-# --- GUI --------------------------------------------------------------------
+# --- Trigger helper ---------------------------------------------------------
+def find_rising_edge(samples: np.ndarray, level_uint16: int, min_amplitude: int = 200) -> int:
+    """
+    Find the first rising edge through level. Returns -1 if no usable edge
+    (no crossing, or signal amplitude below min_amplitude — avoids triggering on noise).
+    """
+    # Reject if signal swing is too small — avoids "locking" on random noise.
+    if int(samples.max()) - int(samples.min()) < min_amplitude:
+        return -1
 
+    level = np.uint16(level_uint16)
+    prev = samples[:-1]
+    curr = samples[1:]
+    mask = (prev < level) & (curr >= level)
+    if not mask.any():
+        return -1
+    return int(np.argmax(mask)) + 1
+
+# --- GUI --------------------------------------------------------------------
 class Viewer(QtWidgets.QMainWindow):
     def __init__(self, port: str):
         super().__init__()
         self.setWindowTitle("STM32H7 Oscilloscope")
-        self.resize(1400, 700)
+        self.resize(1500, 800)
 
-        # Latest frame (set by reader thread, read by GUI timer)
         self.latest_frame = None
         self.latest_frame_lock = threading.Lock()
-
-        # FPS tracking
         self.displayed_frames = 0
         self.last_fps_check = time.monotonic()
         self.current_fps = 0.0
         self.paused = False
 
-        # Central layout
+        # Display state
+        self.db_scale = False
+        self.trigger_enabled = True
+        self.trigger_level = 32768  # midpoint of uint16, auto-initialized after first frame
+
+        # ---- Layout: top bar, plots, bottom bar ----
         central = QtWidgets.QWidget()
         self.setCentralWidget(central)
         vlayout = QtWidgets.QVBoxLayout(central)
 
-        # Top row: readouts + controls
+        # Top row: readouts + high-level controls
         top_row = QtWidgets.QHBoxLayout()
         self.readout_fs = QtWidgets.QLabel("Fs: — Hz")
         self.readout_peak = QtWidgets.QLabel("Peak: — Hz")
@@ -197,6 +205,17 @@ class Viewer(QtWidgets.QMainWindow):
             w.setStyleSheet("font-family: monospace; font-size: 14px; padding: 4px 12px;")
             top_row.addWidget(w)
         top_row.addStretch()
+
+        self.db_btn = QtWidgets.QPushButton("dB scale")
+        self.db_btn.setCheckable(True)
+        self.db_btn.toggled.connect(self._on_db_toggled)
+        top_row.addWidget(self.db_btn)
+
+        self.trigger_btn = QtWidgets.QPushButton("Trigger")
+        self.trigger_btn.setCheckable(True)
+        self.trigger_btn.setChecked(True)
+        self.trigger_btn.toggled.connect(self._on_trigger_toggled)
+        top_row.addWidget(self.trigger_btn)
 
         self.pause_btn = QtWidgets.QPushButton("Pause")
         self.pause_btn.setCheckable(True)
@@ -214,6 +233,12 @@ class Viewer(QtWidgets.QMainWindow):
         self.time_plot.setLabel("left", "ADC counts")
         self.time_plot.showGrid(x=True, y=True, alpha=0.3)
         self.time_curve = self.time_plot.plot(pen=pg.mkPen("#00d4aa", width=1))
+        self.trigger_line = pg.InfiniteLine(
+            angle=0,
+            pen=pg.mkPen("#888888", style=QtCore.Qt.PenStyle.DashLine),
+            movable=False,
+        )
+        self.time_plot.addItem(self.trigger_line)
 
         self.freq_plot = plots.addPlot(title="Magnitude Spectrum")
         self.freq_plot.setLabel("bottom", "Frequency", units="Hz")
@@ -224,18 +249,41 @@ class Viewer(QtWidgets.QMainWindow):
             pen=None, symbol="o", symbolSize=10,
             symbolBrush=pg.mkBrush("#ff5050"),
         )
+        self.peak_label = pg.TextItem(
+            text="", color="#ff5050", anchor=(0.5, 1.2),
+        )
+        self.freq_plot.addItem(self.peak_label)
+        self.nyquist_line = pg.InfiniteLine(
+            angle=90,
+            pen=pg.mkPen("#666666", style=QtCore.Qt.PenStyle.DashLine),
+            label="Nyquist (Fs/2)",
+            labelOpts={"position": 0.9, "color": "#999999"},
+        )
+        self.freq_plot.addItem(self.nyquist_line)
 
-        # Start serial reader
+        # Bottom row: trigger level slider
+        bottom_row = QtWidgets.QHBoxLayout()
+        bottom_row.addWidget(QtWidgets.QLabel("Trigger level:"))
+        self.trigger_slider = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
+        self.trigger_slider.setMinimum(0)
+        self.trigger_slider.setMaximum(65535)
+        self.trigger_slider.setValue(32768)
+        self.trigger_slider.valueChanged.connect(self._on_trigger_level_changed)
+        bottom_row.addWidget(self.trigger_slider, stretch=1)
+        self.trigger_level_label = QtWidgets.QLabel("32768")
+        self.trigger_level_label.setStyleSheet("font-family: monospace;")
+        bottom_row.addWidget(self.trigger_level_label)
+        vlayout.addLayout(bottom_row)
+
         self.reader = SerialReader(port, self._on_frame_from_reader)
+        self._first_frame_rendered = False
         self.reader.start()
 
-        # GUI refresh timer (~30 Hz)
         self.timer = QtCore.QTimer()
         self.timer.setInterval(33)
         self.timer.timeout.connect(self._refresh)
         self.timer.start()
 
-    # Called from the reader thread — keep it minimal, no Qt widget touches
     def _on_frame_from_reader(self, frame: Frame):
         with self.latest_frame_lock:
             self.latest_frame = frame
@@ -243,6 +291,18 @@ class Viewer(QtWidgets.QMainWindow):
     def _on_pause(self, checked: bool):
         self.paused = checked
         self.pause_btn.setText("Resume" if checked else "Pause")
+
+    def _on_db_toggled(self, checked: bool):
+        self.db_scale = checked
+        # Re-label y-axis so it's honest about units
+        self.freq_plot.setLabel("left", "Magnitude (dB)" if checked else "Magnitude")
+
+    def _on_trigger_toggled(self, checked: bool):
+        self.trigger_enabled = checked
+
+    def _on_trigger_level_changed(self, value: int):
+        self.trigger_level = value
+        self.trigger_level_label.setText(str(value))
 
     def _refresh(self):
         if self.paused:
@@ -254,24 +314,63 @@ class Viewer(QtWidgets.QMainWindow):
         if frame is None:
             return
 
-        # Time-domain: x axis in seconds, samples centered at 0
         fs = max(frame.sample_rate_hz, 1)
-        t = np.arange(WAVEFORM_SAMPLES, dtype=np.float32) / fs
-        y = frame.samples.astype(np.float32) - 32768.0
+
+        # ---- Waveform: apply trigger to align ----
+        samples = frame.samples
+        
+        if self.trigger_enabled:
+          edge_idx = find_rising_edge(samples, self.trigger_level)
+          if edge_idx > 0:
+              # Show only from the edge onward. No pre-trigger history, no padding
+              # gymnastics. The visible window shrinks to (N - edge_idx) samples but
+              # the user gets a clean, stable waveform that starts AT the trigger.
+              samples = samples[edge_idx:]
+          # If edge_idx <= 0 (no edge or edge at 0), show raw samples as-is
+
+        t = np.arange(len(samples), dtype=np.float32) / fs        
+        y = samples.astype(np.float32) - 32768.0
         self.time_curve.setData(t, y)
 
-        # Frequency-domain: x axis in Hz
+        # Move trigger-level horizontal line (centered around 0 after DC-removal)
+        self.trigger_line.setValue(self.trigger_level - 32768)
+
+        # ---- Spectrum ----
         freqs = np.arange(MAG_BINS, dtype=np.float32) * fs / (2 * MAG_BINS)
-        # Skip bin 0 (DC) when plotting so the spectrum doesn't get crushed
-        self.freq_curve.setData(freqs[1:], frame.magnitudes[1:])
+        mags = frame.magnitudes
+
+        if self.db_scale:
+            # Avoid log(0); clamp at a tiny floor
+            display_mags = 20.0 * np.log10(np.maximum(mags, 1e-6))
+        else:
+            display_mags = mags
+
+        # Skip bin 0 (DC) for display
+        self.freq_curve.setData(freqs[1:], display_mags[1:])
 
         peak_hz = frame.peak_bin * fs / (2 * MAG_BINS)
-        self.peak_marker.setData([peak_hz], [frame.peak_mag])
+        peak_y = display_mags[frame.peak_bin] if frame.peak_bin < MAG_BINS else 0.0
+        self.peak_marker.setData([peak_hz], [peak_y])
+        # Format peak label nicely: kHz if >= 1 kHz, Hz otherwise
+        if peak_hz >= 1000:
+            label_text = f"{peak_hz / 1000:.2f} kHz"
+        else:
+            label_text = f"{peak_hz:.0f} Hz"
+        self.peak_label.setText(label_text)
+        self.peak_label.setPos(peak_hz, peak_y)
+
+        # Nyquist line at Fs/2
+        self.nyquist_line.setValue(fs / 2)
 
         # Readouts
         self.readout_fs.setText(f"Fs: {fs:>10,} Hz")
-        self.readout_peak.setText(f"Peak: {peak_hz:>8,.0f} Hz  (bin {frame.peak_bin})")
+        self.readout_peak.setText(f"Peak: {label_text:>12}  (bin {frame.peak_bin})")
         self.readout_drops.setText(f"CRC errors: {self.reader.parser.crc_errors}")
+
+        if not self._first_frame_rendered:
+          self.time_plot.enableAutoRange(False)
+          self.freq_plot.enableAutoRange(False)
+          self._first_frame_rendered = True
 
         # FPS
         self.displayed_frames += 1

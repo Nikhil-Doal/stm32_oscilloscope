@@ -73,38 +73,23 @@ const osThreadAttr_t defaultTask_attributes = {
   .priority = (osPriority_t) osPriorityNormal,
 };
 /* USER CODE BEGIN PV */
-volatile uint32_t adc_value = 0;
-
 #define ADC_BUFFER_SIZE 4096
+#define FFT_SIZE 1024
+
 __attribute__((section(".adc_buffer"), aligned(32)))
 uint16_t adc_buffer[ADC_BUFFER_SIZE];
 
 volatile uint32_t dma_half_count = 0;
 volatile uint32_t dma_full_count = 0;
-volatile uint16_t sample_seen_by_cpu = 0;
-volatile uint32_t avg_seen_by_cpu = 0;
 
-volatile uint16_t buf_min = 0;
-volatile uint16_t buf_max = 0;
-volatile uint16_t buf_p2p = 0;
-
-#define FFT_SIZE 1024
 
 // FFT buffers (can stay in cacheable memory as only DMA buffer needs MPU)
 static float32_t fft_input[FFT_SIZE];
 static float32_t fft_output[FFT_SIZE]; // [r0, i0, r1, i1 ...]
 static float32_t fft_magnitudes[FFT_SIZE / 2]; // half-spectrum, real to conjugate symmetric
-
 static arm_rfft_fast_instance_f32 fft_inst;
 
-// debugger values for testing
-volatile uint32_t peak_bin = 0;
-volatile float32_t peak_magnitude = 0.0f;
-volatile float32_t dc_magnitude = 0.0f;
 volatile uint32_t measured_sample_rate = 0;
-
-volatile uint32_t sys_clock_hz = 0;
-volatile uint32_t hclk_hz = 0;
 
 // Primitives for FreeRTOS
 osSemaphoreId_t adcDataSemaphore;
@@ -128,11 +113,6 @@ typedef enum {
 	BUFFER_HALF_FIRST = 0,
 	BUFFER_HALF_SECOND = 1,
 } BufferHalf_t;
-
-// Task health counters
-volatile uint32_t acq_task_runs = 0;
-volatile uint32_t proc_task_runs = 0;
-volatile uint32_t coms_task_runs = 0;
 
 // binary frame buffer 6167 bytes - too big for task stack so we make it static global
 static uint8_t frame_buffer[FRAME_TOTAL_BYTES];
@@ -202,8 +182,6 @@ int main(void)
   if (arm_rfft_fast_init_f32(&fft_inst, FFT_SIZE) != ARM_MATH_SUCCESS) {
 	  Error_Handler();
   }
-  sys_clock_hz = HAL_RCC_GetSysClockFreq();
-  hclk_hz = HAL_RCC_GetHCLKFreq();
   /* USER CODE END 2 */
 
   /* Init scheduler */
@@ -280,47 +258,6 @@ int main(void)
   /* USER CODE BEGIN WHILE */
   while (1)
   {
-	  // copy and convert adc samples (16 bit) to f32
-	  // we can subtract 32768 to make 0 mean, so DC bin doesnt dominate
-	  for (int i = 0; i < FFT_SIZE; ++i) {
-		fft_input[i] = (float32_t)adc_buffer[i] - 32768.0f;
-	  }
-
-	  // foward Real FFT, i.e input to output (with complex interleaved)
-	  arm_rfft_fast_f32(&fft_inst, fft_input, fft_output, 0);
-
-	  // compute the magnitude of each complex bin
-	  // output has FFT_SIZE/2 pairs, we skip Nyquist
-	  arm_cmplx_mag_f32(fft_output, fft_magnitudes, FFT_SIZE / 2);
-
-	  // now we find the peak, skip bin 0 and start at bin 2
-	  // prevents leakage
-	  dc_magnitude = fft_magnitudes[0];
-	  uint32_t best_bin = 1;
-	  float32_t best_mag = 0.0f;
-
-	  for (uint32_t i = 2; i < FFT_SIZE/2; ++i) {
-		  if (fft_magnitudes[i] > best_mag) {
-			  best_mag = fft_magnitudes[i];
-			  best_bin = i;
-		  }
-	  }
-
-	  peak_bin = best_bin;
-	  peak_magnitude = best_mag;
-
-	  static uint32_t last_full_count = 0;
-	  static uint32_t last_tick = 0;
-	  uint32_t now = HAL_GetTick();
-	  if (now - last_tick >= 1000) {
-	      uint32_t delta = dma_full_count - last_full_count;
-	      measured_sample_rate = delta * ADC_BUFFER_SIZE;
-	      last_full_count = dma_full_count;
-	      last_tick = now;
-	  }
-
-	  HAL_GPIO_TogglePin(LED1_GPIO_PORT, LED1_PIN);
-	  HAL_Delay(200);
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
@@ -523,8 +460,6 @@ static void AcquisitionTask(void *argument) {
 
         // Alternate for next iteration
         next_half = (next_half == BUFFER_HALF_FIRST) ? BUFFER_HALF_SECOND : BUFFER_HALF_FIRST;
-
-        acq_task_runs++;
     }
 }
 
@@ -547,7 +482,6 @@ static void ProcessingTask(void *argument) {
         arm_rfft_fast_f32(&fft_inst, fft_input, fft_output, 0);
         arm_cmplx_mag_f32(fft_output, fft_magnitudes, FFT_SIZE / 2);
 
-        dc_magnitude = fft_magnitudes[0];
         uint32_t best_bin = 1;
         float32_t best_mag = 0.0f;
         for (uint32_t i = 2; i < FFT_SIZE / 2; i++) {
@@ -557,9 +491,6 @@ static void ProcessingTask(void *argument) {
             }
         }
 
-        peak_bin = best_bin;
-        peak_magnitude = best_mag;
-
         memcpy(latest_samples, src, WAVEFORM_SAMPLES * sizeof(uint16_t));
         memcpy(latest_magnitudes, fft_magnitudes, MAG_BINS * sizeof(float32_t));
 
@@ -567,8 +498,6 @@ static void ProcessingTask(void *argument) {
         latest_results.peak_bin = best_bin;
         latest_results.peak_magnitude = best_mag;
         latest_results.timestamp_tick = osKernelGetTickCount();
-
-        proc_task_runs++;
     }
 }
 
@@ -688,7 +617,6 @@ void StartDefaultTask(void *argument)
 	  build_and_send_frame();
 
 	  HAL_GPIO_TogglePin(LED1_GPIO_PORT, LED1_PIN);
-	  coms_task_runs++;
 
 	  osDelay(33);
   }

@@ -2,7 +2,7 @@
 
 Real-time digital oscilloscope on a NUCLEO-H753ZI. An analog signal on PA3 is sampled at ~1.2 MSa/s by a 16-bit ADC, captured via DMA into an SRAM ring buffer, processed by a FreeRTOS task pipeline that runs a 1024-point FFT using CMSIS-DSP, and streamed over USB CDC as binary frames to a Python pyqtgraph viewer.
 
-![Live viewer showing a 30 kHz square wave with clean odd-harmonic spectrum](docs/viewer-running.png)
+![Live viewer showing a 3.49 kHz sine with a single FFT peak](docs/viewer-running-sine.png)
 
 ## Hardware
 
@@ -127,9 +127,21 @@ Sample rate is verified two ways: the MCU counts its own `dma_full_count` per se
 
 ## Results
 
-Feeding a 30 kHz 50%-duty square wave from a 555 astable into PA3 produces full rail-to-rail capture in the time domain and a textbook spectrum with the fundamental at 30 kHz plus odd harmonics (3f, 5f, 7f, …) falling off as 1/n. This is exactly what Fourier says a square wave should look like, which is the best proof I have that the FFT path is honest.
+The FFT pipeline was validated against three known waveforms with distinct spectral signatures.
 
-The peak-bin-to-frequency mapping `peak_hz = peak_bin × Fs / N` agrees sub-bin with a known input. With the 555 tuned to 33.7 kHz and Fs ≈ 1.2 MSa/s, N = 1024, peak_bin reads 29 (expected 29.2).
+**Square wave** (555 astable, ~30 kHz) produced full rail-to-rail capture in the time domain and a textbook spectrum: fundamental plus odd harmonics (3f, 5f, 7f, …) falling off as 1/n. This is exactly what Fourier theory predicts for an ideal square wave.
+
+![Square wave input: 1/n odd-harmonic falloff](docs/viewer-running-square.png)
+
+**Sine** (function generator, 3.49 kHz) produced a single sharp peak at the fundamental with no visible harmonics in the linear-scale spectrum, confirming the FFT and ADC paths aren't introducing distortion of their own.
+
+![Sine input: single peak at 3.49 kHz](docs/viewer-running-sine.png)
+
+**Triangle** (function generator, 6.98 kHz) produced the fundamental plus odd harmonics with 1/n² amplitude falloff — visibly faster decay than the square wave's 1/n.
+
+![Triangle input: odd harmonics with 1/n² falloff](docs/viewer-running-triangle.png)
+
+The peak-bin-to-frequency mapping `peak_hz = peak_bin × Fs / N` agrees sub-bin with each known input. With the 555 tuned to 33.7 kHz and Fs ≈ 1.2 MSa/s, N = 1024, peak_bin reads 29 (expected 29.2).
 
 ## Building and running
 
